@@ -11,7 +11,7 @@ import HunyuanPaintMLX
 /// any option not in `bools` consumes the following token as its value. Bare tokens are positional.
 struct Args {
     private(set) var positional: [String] = []
-    private var options: [String: String] = [:]
+    private var options: [String: [String]] = [:]
     private var boolFlags: Set<String> = []
 
     init(_ argv: [String], bools: Set<String> = []) {
@@ -23,7 +23,7 @@ struct Args {
                 if bools.contains(name) {
                     boolFlags.insert(name); i += 1
                 } else if i + 1 < argv.count {
-                    options[name] = argv[i + 1]; i += 2
+                    options[name, default: []].append(argv[i + 1]); i += 2
                 } else {
                     boolFlags.insert(name); i += 1        // trailing flag with no value
                 }
@@ -33,9 +33,21 @@ struct Args {
         }
     }
 
-    func str(_ names: String...) -> String? { for n in names where options[n] != nil { return options[n] }; return nil }
-    func int(_ names: String...) -> Int? { for n in names { if let v = options[n] { return Int(v) } }; return nil }
-    func float(_ names: String...) -> Float? { for n in names { if let v = options[n] { return Float(v) } }; return nil }
+    func str(_ names: String...) -> String? {
+        for n in names { if let v = options[n]?.last { return v } }
+        return nil
+    }
+    func strings(_ names: String...) -> [String] {
+        names.flatMap { options[$0] ?? [] }
+    }
+    func int(_ names: String...) -> Int? {
+        for n in names { if let v = options[n]?.last, let value = Int(v) { return value } }
+        return nil
+    }
+    func float(_ names: String...) -> Float? {
+        for n in names { if let v = options[n]?.last, let value = Float(v) { return value } }
+        return nil
+    }
     func flag(_ name: String) -> Bool { boolFlags.contains(name) }
 }
 
@@ -125,17 +137,19 @@ func printUsage() {
     hy3d — Hunyuan3D shape + paint, native MLX-Swift.
 
     USAGE:
+      hy3d cutout  <input.png> <output.png>
+
       hy3d shape    <image.png> -o <out.glb> --weights <dir>
                     [--steps N] [--guidance F] [--octree N] [--quantize 4|8] [--seed N]
 
       hy3d paint    <mesh.glb|obj> <image.png> -o <out.glb> --weights <dir>
                     [--model rgb|pbr] [--res N] [--steps N] [--tex N] [--no-superres]
-                    [--cache-mb N] [--seed N]
+                    [--paint-ref <detail-or-view.png>]... [--cache-mb N] [--seed N]
 
       hy3d generate <image.png> -o <out.glb> --shape-weights <dir> --paint-weights <dir>
                     [--paint-model rgb|pbr] [--steps N] [--guidance F] [--octree N]
                     [--quantize 4|8] [--paint-steps N] [--res N] [--tex N] [--no-superres]
-                    [--cache-mb N] [--seed N]
+                    [--paint-ref <detail-or-view.png>]... [--cache-mb N] [--seed N]
 
       hy3d parity-shape [--fixtures <dir>] [--weights <dir>] [--weights-turbo <dir>]
       hy3d parity-paint [--fixtures <dir>]
@@ -144,10 +158,13 @@ func printUsage() {
     else ./fixtures.
 
     Notes:
+      • Shape generation expects a segmented RGBA image. Use cutout for opaque inputs.
       • shape --weights points at a checkpoint directory (model.fp16.safetensors + config.yaml).
       • paint --weights accepts the downloaded paint bundle (vae/, unet/, dinov2/,
         realesrgan/) and the older nested checkpoint layout.
       • --octree N is the SDF grid resolution (octree decode). Default 256.
+      • Repeat --paint-ref to add reference-attention images for texture/detail conditioning.
+        The first positional image remains the shape input and primary DINO paint reference.
       • paint models are loaded one stage at a time; --cache-mb defaults to 128 for 24 GB Macs.
       • --seed is honored by shape, paint and the chained generate command.
     """)

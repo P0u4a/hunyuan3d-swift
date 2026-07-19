@@ -98,6 +98,30 @@ swift run -c release hy3d paint mesh.glb photo.png -o textured.glb \
   --weights weights/paint-large --model pbr
 ```
 
+additional paint references (repeat the option up to four times for detail crops or coherent alternate views):
+
+```bash
+.build/xcode/Build/Products/Release/hy3d paint mesh.glb primary.png \
+  -o textured.glb --weights weights/paint-large --model pbr \
+  --paint-ref face-and-shirt-detail.png \
+  --paint-ref rear-or-three-quarter-view.png
+```
+
+the primary image remains the global dino reference. all images, including repeated
+`--paint-ref` values, are VAE-encoded as separate reference-attention inputs. this improves
+texture and visible detail conditioning; it does not add geometric detail to the shape mesh.
+
+shape generation expects the subject on a transparent background. for opaque photos or renders,
+create a native macOS Vision cutout first (macOS 14+):
+
+```bash
+.build/xcode/Build/Products/Release/hy3d cutout source.png source-cutout.png
+.build/xcode/Build/Products/Release/hy3d generate source-cutout.png \
+  -o model.glb --shape-weights weights/shape-small --paint-weights weights/paint-large
+```
+
+without this step, gradients or studio backdrops can be reconstructed as unwanted planar geometry.
+
 replace `swift run -c release hy3d` in the examples above with
 `.build/xcode/Build/Products/Release/hy3d` for the metal-enabled command-line build.
 

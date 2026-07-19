@@ -19,19 +19,29 @@ func cmdPaint(_ args: Args) throws {
     let superRes = !args.flag("no-superres")
     let seed = UInt64(args.int("seed") ?? 0)
     let cacheMB = args.int("cache-mb") ?? 128
+    let paintRefs = args.strings("paint-ref", "ref")
+    guard paintRefs.count <= 4 else {
+        throw CLIError("paint: at most four additional references are supported")
+    }
+    for path in paintRefs where !FileManager.default.fileExists(atPath: path) {
+        throw CLIError("paint: additional reference not found: \(path)")
+    }
     MLX.Memory.peakMemory = 0
 
     let pipe = PaintPipeline(weightsRoot: weights, res: res, steps: steps, tex: tex,
                              superRes: superRes, cacheLimitMB: cacheMB)
-    print("paint (\(model)): mesh=\(meshPath) image=\(imagePath) res=\(res) steps=\(steps) tex=\(tex) super-res=\(superRes)")
+    print("paint (\(model)): mesh=\(meshPath) image=\(imagePath) refs=\(paintRefs.count + 1) " +
+          "res=\(res) steps=\(steps) tex=\(tex) super-res=\(superRes)")
     switch model {
     case "pbr":
-        try pipe.run(meshPath: meshPath, imagePath: imagePath, outGLB: out, seed: seed)
+        try pipe.run(meshPath: meshPath, imagePath: imagePath, outGLB: out,
+                     referenceImagePaths: paintRefs, seed: seed)
         print("paint: wrote \(out)")
     case "rgb":
         let lm = loadMesh(meshPath)
         guard lm.vertexCount > 0 else { throw CLIError("paint: failed to load mesh \(meshPath)") }
-        guard let r = try pipe.paintRGB(mesh: lm, imagePath: imagePath, seed: seed, onProgress: { s, f in
+        guard let r = try pipe.paintRGB(mesh: lm, imagePath: imagePath,
+                                        referenceImagePaths: paintRefs, seed: seed, onProgress: { s, f in
             print(String(format: "  [%3.0f%%] %@", f * 100, s))
         }) else { throw CLIError("paint: RGB pipeline returned no result (UV unwrap failed?)") }
         try writeGLB(path: out, vertices: r.vertices, faces: r.faces, uvs: r.uvs,

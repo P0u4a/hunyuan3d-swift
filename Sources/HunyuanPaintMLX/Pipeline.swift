@@ -105,8 +105,10 @@ public final class PaintPipeline {
               "cache=\(gib(MLX.Memory.cacheMemory)) GiB peak=\(gib(MLX.Memory.peakMemory)) GiB")
     }
 
-    private func encodeControls(normals: [MLXArray], positions: [MLXArray], imagePath: String)
+    private func encodeControls(normals: [MLXArray], positions: [MLXArray],
+                                imagePaths: [String])
         throws -> (normal: MLXArray, position: MLXArray, reference: MLXArray) {
+        precondition(!imagePaths.isEmpty)
         let vae = try loadVAE()
         func enc(_ imgs: [MLXArray]) -> MLXArray {
             vae.encodeMean(stacked(imgs) * 2 - 1) * sf
@@ -115,7 +117,9 @@ public final class PaintPipeline {
         eval(normal)
         let position = enc(positions).expandedDimensions(axis: 0)
         eval(position)
-        let reference = enc([prepRGB(imagePath, res)]).expandedDimensions(axis: 0)
+        // The checkpoint was trained with M reference images. Keep M as the second dimension;
+        // the dual-stream UNet concatenates their per-layer tokens for reference attention.
+        let reference = enc(imagePaths.map { prepRGB($0, res) }).expandedDimensions(axis: 0)
         eval(reference)
         return (normal, position, reference)
     }
@@ -276,11 +280,14 @@ public final class PaintPipeline {
     /// core is shared with the app entry point; this only loads the mesh, writes the debug
     /// texture PNGs next to the output, and serializes the GLB.
     public func run(meshPath: String, imagePath: String, outGLB: String,
+                    referenceImagePaths: [String] = [],
                     guidance: Float = 3.0, seed: UInt64 = 0) throws {
         let t0 = Date()
         func log(_ s: String) { print("[pipeline] \(s)  (\(Int(-t0.timeIntervalSinceNow))s)") }
         let mesh = loadMesh(meshPath)
-        guard let r = try paintPBR(mesh: mesh, imagePath: imagePath, guidance: guidance, seed: seed,
+        guard let r = try paintPBR(mesh: mesh, imagePath: imagePath,
+                                   referenceImagePaths: referenceImagePaths,
+                                   guidance: guidance, seed: seed,
                                    debugPathPrefix: outGLB,
                                    onProgress: { s, _ in log(s) }) else { return }
         // debug: the baked textures next to the GLB (same bytes that get embedded)
@@ -293,7 +300,8 @@ public final class PaintPipeline {
 
     /// 2.0 RGB paint: geometry + reference image → unwrapped geometry + baked base-color texture.
     /// Polls `isCancelled` (returns nil if it fires); streams decoded view grids via `onViews`.
-    public func paintRGB(mesh: LoadedMesh, imagePath: String, guidance: Float = 2.0,
+    public func paintRGB(mesh: LoadedMesh, imagePath: String,
+                         referenceImagePaths: [String] = [], guidance: Float = 2.0,
                          seed: UInt64 = 0,
                          onProgress: ((String, Float) -> Void)? = nil,
                          isCancelled: () -> Bool = { false },
@@ -309,8 +317,10 @@ public final class PaintPipeline {
         onProgress?("Rendering control maps", 0.1)
         let ctrl = zip(elevs, azims).map { R.renderControl($0.0, $0.1, res) }
         let normals = ctrl.map { $0.0 }, positions = ctrl.map { $0.1 }
-        onProgress?("Encoding controls", 0.12)
-        let encoded = try encodeControls(normals: normals, positions: positions, imagePath: imagePath)
+        let allReferences = [imagePath] + referenceImagePaths
+        onProgress?("Encoding controls + \(allReferences.count) reference(s)", 0.12)
+        let encoded = try encodeControls(normals: normals, positions: positions,
+                                         imagePaths: allReferences)
         releaseStage()
         memoryLine("VAE encoder released")
         if isCancelled() { return nil }
@@ -350,7 +360,8 @@ public final class PaintPipeline {
     /// nil if it fires), streams decoded albedo view grids via `onViews`, reports stages via
     /// `onProgress`. Debug artifacts are written only when `debugPathPrefix` is set (the CLI
     /// passes the output GLB path): `<prefix>.views.png` and `<prefix>.rendercheck.png`.
-    public func paintPBR(mesh: LoadedMesh, imagePath: String, guidance: Float = 3.0,
+    public func paintPBR(mesh: LoadedMesh, imagePath: String,
+                         referenceImagePaths: [String] = [], guidance: Float = 3.0,
                          seed: UInt64 = 0,
                          debugPathPrefix: String? = nil,
                          onProgress: ((String, Float) -> Void)? = nil,
@@ -367,11 +378,15 @@ public final class PaintPipeline {
         onProgress?("Rendering control maps", 0.1)
         let ctrl = zip(elevs, azims).map { R.renderControl($0.0, $0.1, res) }
         let normals = ctrl.map { $0.0 }, positions = ctrl.map { $0.1 }
-        onProgress?("Encoding controls", 0.12)
-        let encoded = try encodeControls(normals: normals, positions: positions, imagePath: imagePath)
+        let allReferences = [imagePath] + referenceImagePaths
+        onProgress?("Encoding controls + \(allReferences.count) reference(s)", 0.12)
+        let encoded = try encodeControls(normals: normals, positions: positions,
+                                         imagePaths: allReferences)
         releaseStage()
         memoryLine("VAE encoder released")
         onProgress?("Encoding reference", 0.14)
+        // The original 2.1 model intentionally feeds only cond_imgs[:, :1] to DINO. Additional
+        // images enrich dual-stream reference attention without changing global identity/layout.
         let dinoHS = try dinoHidden(imagePath)
         releaseStage()
         memoryLine("DINO released")

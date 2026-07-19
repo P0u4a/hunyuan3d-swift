@@ -28,6 +28,13 @@ func cmdGenerate(_ args: Args) throws {
     let tex = args.int("tex") ?? (paintModel == "pbr" ? 4096 : 2048)
     let superRes = !args.flag("no-superres")
     let cacheMB = args.int("cache-mb") ?? 128
+    let paintRefs = args.strings("paint-ref", "ref")
+    guard paintRefs.count <= 4 else {
+        throw CLIError("generate: at most four additional paint references are supported")
+    }
+    for path in paintRefs where !FileManager.default.fileExists(atPath: path) {
+        throw CLIError("generate: additional paint reference not found: \(path)")
+    }
     MLX.Memory.peakMemory = 0
 
     // ---- 1. shape ----
@@ -44,7 +51,8 @@ func cmdGenerate(_ args: Args) throws {
     print("generate[1/2] shape mesh: \(mesh.vertices.count) verts, \(mesh.faces.count) faces")
 
     // ---- 2. paint ----
-    print("generate[2/2] paint (\(paintModel)): res=\(res) steps=\(paintSteps) tex=\(tex) super-res=\(superRes)")
+    print("generate[2/2] paint (\(paintModel)): refs=\(paintRefs.count + 1) res=\(res) " +
+          "steps=\(paintSteps) tex=\(tex) super-res=\(superRes)")
     let pipe = PaintPipeline(weightsRoot: paintW, res: res, steps: paintSteps, tex: tex,
                              superRes: superRes, cacheLimitMB: cacheMB)
     switch paintModel {
@@ -54,9 +62,11 @@ func cmdGenerate(_ args: Args) throws {
             .appendingPathComponent("hy3d_shape_\(UUID().uuidString).glb")
         try GLB.write(mesh, to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try pipe.run(meshPath: tmp.path, imagePath: imagePath, outGLB: out, seed: seed)
+        try pipe.run(meshPath: tmp.path, imagePath: imagePath, outGLB: out,
+                     referenceImagePaths: paintRefs, seed: seed)
     case "rgb":
-        guard let r = try pipe.paintRGB(mesh: flatten(mesh), imagePath: imagePath, seed: seed, onProgress: { s, f in
+        guard let r = try pipe.paintRGB(mesh: flatten(mesh), imagePath: imagePath,
+                                        referenceImagePaths: paintRefs, seed: seed, onProgress: { s, f in
             print(String(format: "  [%3.0f%%] %@", f * 100, s))
         }) else { throw CLIError("generate: paint stage returned no result (UV unwrap failed?)") }
         try writeGLB(path: out, vertices: r.vertices, faces: r.faces, uvs: r.uvs,
