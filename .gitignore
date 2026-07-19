@@ -8,9 +8,10 @@ weights/
 __pycache__/
 outputs/
 
-# Heavy E2E artifacts (GLBs, full-res renders, logs). Curated README images live
-# in docs/images/ and are committed explicitly.
+# Generated E2E artifacts, renders, galleries, and concept images stay local.
 docs/e2e/
+docs/images/
+python/shape/docs/*.png
 
 # Python reference implementations (python/shape, python/paint): environments,
 # caches, multi-GB weights, generated outputs, and oracle build artifacts are all

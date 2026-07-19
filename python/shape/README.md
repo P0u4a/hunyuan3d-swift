@@ -11,13 +11,7 @@ Fully **MLX-native** Apple-Silicon image→mesh shape generator for the Hunyuan3
 Per-stage parity-verified vs the torch reference; weight quantization and FlashVDM-style
 octree decode bring the bigger model to **~79 s / 3 GB** on a Mac, near-lossless.
 
-![demo](docs/demo_render.png)
-
-*(penguin holding an "HY3D" sign — reconstructed from a single image, fully on MLX)*
-
-![gallery](docs/gallery.png)
-
-*(generalization — plush toy, revolver, ornate staff, each via 2.0 with octree decode + 8-bit)*
+Demo and gallery renders are generated locally and intentionally excluded from Git.
 
 One config-driven codebase spans three architectures (FLUX-style `Hunyuan3DDiT` and the
 U-Net `HunYuanDiTPlain`+MoE; DINOv2-giant SwiGLU and DINOv2-large MLP conditioners) — adding a
