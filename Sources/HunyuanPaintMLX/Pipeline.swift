@@ -424,9 +424,13 @@ public final class PaintPipeline {
         let texA = MeshRender.inpaint(texs[0], covered), texM = MeshRender.inpaint(texs[1], covered)
         eval(texA, texM)
         if let p = debugPathPrefix {
-            // debug: render the texture back onto the mesh (bypasses GLB) at 3 angles
-            let dbg = [R.renderTextured(0, 20, 420, texA), R.renderTextured(0, 140, 420, texA), R.renderTextured(0, 260, 420, texA)]
-            saveRGB(concatenated(dbg, axis: 1), "\(p).rendercheck.png")
+            // Debug: render the texture back onto the mesh (bypasses GLB) at three angles. Keep a
+            // single-sample image so silhouette changes can be distinguished from preview aliasing.
+            let angles: [Float] = [20, 140, 260]
+            let raw = angles.map { R.renderTextured(0, $0, 420, texA) }
+            saveRGB(concatenated(raw, axis: 1), "\(p).rendercheck-1x.png")
+            let aa = angles.map { R.renderTexturedAntialiased(0, $0, 420, texA, scale: 2) }
+            saveRGB(concatenated(aa, axis: 1), "\(p).rendercheck.png")
         }
         guard let albedoPNG = pngData(texA), let mrPNG = pngData(texM) else { return nil }
         var uvOut = uw.uvs

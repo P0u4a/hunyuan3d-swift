@@ -142,6 +142,8 @@ func printUsage() {
       hy3d shape    <image.png> -o <out.glb> --weights <dir>
                     [--steps N] [--guidance F] [--octree N] [--quantize 4|8] [--seed N]
 
+      hy3d preview  <mesh.glb|obj> -o <out.png> [--res N] [--ssaa 1|2|3|4]
+
       hy3d paint    <mesh.glb|obj> <image.png> -o <out.glb> --weights <dir>
                     [--model rgb|pbr] [--res N] [--steps N] [--tex N] [--no-superres]
                     [--paint-ref <detail-or-view.png>]... [--cache-mb N] [--seed N]

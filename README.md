@@ -91,6 +91,14 @@ swift run -c release hy3d shape photo.png -o mesh.glb \
   --weights weights/shape-small
 ```
 
+Render a geometry-only normal preview at three angles. `--ssaa 2` rasterizes at twice the linear
+resolution and downsamples pixel footprints so the preview silhouette is not confused with
+single-sample aliasing:
+
+```bash
+swift run -c release hy3d preview mesh.glb -o mesh-preview.png --res 600 --ssaa 2
+```
+
 paint an existing mesh:
 
 ```bash

@@ -1,6 +1,6 @@
 import Foundation
 
-// hy3d — one executable, six subcommands. Hand-rolled dispatch (no ArgumentParser dependency).
+// hy3d — one executable, seven subcommands. Hand-rolled dispatch (no ArgumentParser dependency).
 setbuf(stdout, nil)   // unbuffered so progress prints appear promptly
 
 let argv = Array(CommandLine.arguments.dropFirst())
@@ -11,6 +11,7 @@ do {
     switch sub {
     case "cutout":        try cmdCutout(Args(rest))
     case "shape":         try cmdShape(Args(rest))
+    case "preview":       try cmdPreview(Args(rest))
     case "paint":         try cmdPaint(Args(rest, bools: ["no-superres"]))
     case "generate":      try cmdGenerate(Args(rest, bools: ["no-superres"]))
     case "parity-shape":  try cmdParityShape(Args(rest))

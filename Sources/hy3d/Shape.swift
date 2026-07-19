@@ -25,6 +25,7 @@ func cmdShape(_ args: Args) throws {
     let resolution = args.int("octree") ?? 256
     let quantize = args.int("quantize") ?? 0
     let seed = UInt64(args.int("seed") ?? 0)
+    MLX.Memory.peakMemory = 0
 
     print("shape: \(wURL.lastPathComponent) (\(quantize == 0 ? "fp16" : "\(quantize)-bit"))  steps=\(steps) guidance=\(guidance) octree=\(resolution)")
     let gen = try ShapeGenerator(weightsURL: wURL, quantize: quantize)
@@ -35,6 +36,7 @@ func cmdShape(_ args: Args) throws {
         print(String(format: "  [%3.0f%%] %@", p.fraction * 100, p.stage))
     }
     print(String(format: "shape: %d verts, %d faces in %.1fs -> %@", v, f, -t0.timeIntervalSinceNow, out))
+    print(String(format: "shape: MLX peak %.2f GiB", Double(MLX.Memory.peakMemory) / 1_073_741_824))
 }
 
 // MARK: - hy3d parity-shape (print-panel; ported from the v1 hy3d-cli parity harness)

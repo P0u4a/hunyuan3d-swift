@@ -155,6 +155,28 @@ public final class MeshRender {
         return col * bgm + (1 - bgm)
     }
 
+    /// Debug/evaluation render with supersample antialiasing. Rasterize at `scale` times the
+    /// requested linear resolution, then average each scale x scale pixel footprint. Keeping this
+    /// separate from the paint control-map renderer avoids changing model inputs or baked textures.
+    public func renderTexturedAntialiased(_ elev: Float, _ azim: Float, _ res: Int,
+                                          _ tex: MLXArray, scale: Int = 2) -> MLXArray {
+        precondition(scale >= 1, "supersample scale must be at least one")
+        guard scale > 1 else { return renderTextured(elev, azim, res, tex) }
+        let hi = renderTextured(elev, azim, res * scale, tex)
+        return MeshRender.downsampleSSAA(hi, scale: scale)
+    }
+
+    /// Box-filter an `[H*scale,W*scale,C]` supersampled image to `[H,W,C]`.
+    public static func downsampleSSAA(_ image: MLXArray, scale: Int) -> MLXArray {
+        precondition(scale >= 1, "supersample scale must be at least one")
+        precondition(image.ndim == 3, "SSAA input must be HWC")
+        precondition(image.dim(0) % scale == 0 && image.dim(1) % scale == 0,
+                     "SSAA input dimensions must be divisible by scale")
+        guard scale > 1 else { return image }
+        let h = image.dim(0) / scale, w = image.dim(1) / scale, c = image.dim(2)
+        return image.reshaped([h, scale, w, scale, c]).mean(axes: [1, 3])
+    }
+
     /// Bilinear gather: img [H,W,C] at (rowF,colF) [K] → [K,C].
     static func bilinear(_ img: MLXArray, _ rowF: MLXArray, _ colF: MLXArray) -> MLXArray {
         let H = img.dim(0), W = img.dim(1), C = img.dim(2)

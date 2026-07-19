@@ -8,6 +8,14 @@ import HunyuanPaintMLX
 final class PaintParityTests: XCTestCase {
     let fx = FixtureStore()
 
+    func testSSAADownsampleGroupsPixelFootprints() {
+        let image = MLXArray((0..<16).map(Float.init), [4, 4, 1])
+        let got = MeshRender.downsampleSSAA(image, scale: 2)
+        eval(got)
+        XCTAssertEqual(got.shape, [2, 2, 1])
+        XCTAssertEqual(got.asArray(Float.self), [2.5, 4.5, 10.5, 12.5])
+    }
+
     // §7: Paint VAE enc/dec — maxabs ≤ 1e-6 (bit-exact)
     func testPaintVAE() throws {
         let vae = PaintVAE(try fx.requireW("vae_weights.safetensors"))
