@@ -41,7 +41,13 @@ public struct Dinov2 {
         let patches = p.reshaped([B, p.dim(1) * p.dim(2), C])
         let cls = broadcast(w.a("embeddings.cls_token"), to: [B, 1, C])
         var x = concatenated([cls, patches], axis: 1) + w.a("embeddings.position_embeddings")
-        for i in 0 ..< layers { x = layer(x, "encoder.layer.\(i)") }
+        // MLX is lazy: without a barrier this retains the graph and intermediates for all 40
+        // giant-ViT blocks. Materializing each residual output keeps only one block live.
+        for i in 0 ..< layers {
+            x = layer(x, "encoder.layer.\(i)")
+            eval(x)
+            MLX.Memory.clearCache()
+        }
         return ln(x, "layernorm")
     }
 }

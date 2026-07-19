@@ -4,13 +4,18 @@ import MLXRandom
 
 /// Weight loading from the original torch safetensors (NCHW conv → NHWC transpose + substring renames).
 public enum Weights {
-    public static func loadTorch(_ path: String, renames: [(String, String)] = []) throws -> [String: MLXArray] {
+    /// Load a torch-layout checkpoint and keep floating-point weights compact. The published paint
+    /// checkpoints contain a mixture of fp32/fp16/bf16 tensors; forcing every tensor to fp32 was
+    /// the largest source of avoidable resident memory on Apple Silicon.
+    public static func loadTorch(_ path: String, renames: [(String, String)] = [],
+                                 dtype: DType = .float16) throws -> [String: MLXArray] {
         let sd = try loadArrays(url: URL(fileURLWithPath: path))
         var out = [String: MLXArray]()
         for (k0, v0) in sd {
             var k = k0
             for (a, b) in renames { k = k.replacingOccurrences(of: a, with: b) }
-            out[k] = (v0.ndim == 4 ? v0.transposed(0, 2, 3, 1) : v0).asType(.float32)
+            let layout = v0.ndim == 4 ? v0.transposed(0, 2, 3, 1) : v0
+            out[k] = layout.dtype.isFloatingPoint && layout.dtype != dtype ? layout.asType(dtype) : layout
         }
         return out
     }
@@ -45,7 +50,9 @@ public struct PBRPaintResult {
 }
 
 /// Paint pipeline in Swift: mesh + image → textured geometry. Port of run_paint*.py.
-/// A class so loaded model weights stay resident across runs.
+/// Models are loaded by stage so the VAE, DINO, dual conditioner, main UNet and super-resolution
+/// network do not all occupy unified memory at once. This trades some checkpoint I/O for a much
+/// lower peak and makes a full PBR run practical on a 24 GB Mac.
 public final class PaintPipeline {
     let weightsRoot: String
     public var res: Int, steps: Int, tex: Int    // per-run knobs; do not affect which weights load
@@ -58,61 +65,222 @@ public final class PaintPipeline {
     let azims: [Float] = [0, 90, 180, 270, 0, 180]
     let vw: [Float] = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
 
-    // Resident RGB (2.0) models, loaded once on first paintRGB.
-    private var rgb: (vae: PaintVAE, wrap: Paint20Wrapper, sr: RealESRGAN?, gen: MLXArray)?
-    // Resident PBR (2.1) models, loaded once on first paintPBR.
-    private var pbr: (vae: PaintVAE, wrap: PBRWrapper, dino: Dinov2, sr: RealESRGAN?)?
-
-    public init(weightsRoot: String, res: Int = 512, steps: Int = 15, tex: Int = 4096, superRes: Bool = true) {
+    public init(weightsRoot: String, res: Int = 512, steps: Int = 15, tex: Int = 4096,
+                superRes: Bool = true, cacheLimitMB: Int = 128) {
         self.weightsRoot = weightsRoot; self.res = res; self.steps = steps; self.tex = tex; self.superRes = superRes
+        MLX.Memory.cacheLimit = cacheLimitMB * 1024 * 1024
     }
 
-    private func loadRGB() throws -> (vae: PaintVAE, wrap: Paint20Wrapper, sr: RealESRGAN?, gen: MLXArray) {
-        if let r = rgb { return r }
-        let vae = PaintVAE(W(try Weights.loadTorch("\(weightsRoot)/hunyuan3d-paint-v2-0/vae/diffusion_pytorch_model.safetensors",
-                                               renames: [(".to_out.0.", ".to_out.")])))
-        let (mainW, dualW) = Weights.splitPBR(try Weights.loadTorch("\(weightsRoot)/hunyuan3d-paint-v2-0/unet/diffusion_pytorch_model.safetensors",
-                                                                renames: [("transformer_blocks.0.transformer.", "transformer_blocks.0.")]))
-        let wrap = Paint20Wrapper(main: mainW, dual: dualW)
-        // Super-res weights are a converted (non-HF) file; if absent, paint still works
-        // without the x4 upscale rather than crashing.
-        var sr: RealESRGAN? = nil
-        if superRes,
-           let arrs = try? loadArrays(url: URL(fileURLWithPath: "\(weightsRoot)/realesrgan/rrdbnet_mlx.safetensors")) {
-            sr = RealESRGAN(W(arrs.mapValues { $0.asType(.float32) }))
+    private func weightPath(_ candidates: String...) -> String {
+        for relative in candidates {
+            let path = "\(weightsRoot)/\(relative)"
+            if FileManager.default.fileExists(atPath: path) { return path }
         }
-        let r = (vae, wrap, sr, mainW.a("learned_text_clip_gen"))
-        rgb = r
-        return r
+        return "\(weightsRoot)/\(candidates[0])"   // preserve a useful load error with expected path
     }
 
-    private func loadPBR() throws -> (vae: PaintVAE, wrap: PBRWrapper, dino: Dinov2, sr: RealESRGAN?) {
-        if let r = pbr { return r }
-        let vae = PaintVAE(W(try Weights.loadTorch("\(weightsRoot)/hunyuan3d-paint-v2-0/vae/diffusion_pytorch_model.safetensors",
-                                               renames: [(".to_out.0.", ".to_out.")])))
-        let (mainW, dualW) = Weights.splitPBR(try Weights.loadTorch("\(weightsRoot)/hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.safetensors"))
-        let wrap = PBRWrapper(main: mainW, dual: dualW, nPbr: 2)
-        let dino = Dinov2(W(try Weights.loadTorch("\(weightsRoot)/dinov2-giant/model.safetensors")))
-        // Same graceful degrade as loadRGB: absent super-res weights skip the x4 upscale.
-        var sr: RealESRGAN? = nil
-        if superRes,
-           let arrs = try? loadArrays(url: URL(fileURLWithPath: "\(weightsRoot)/realesrgan/rrdbnet_mlx.safetensors")) {
-            sr = RealESRGAN(W(arrs.mapValues { $0.asType(.float32) }))
+    private func loadVAE() throws -> PaintVAE {
+        PaintVAE(W(try Weights.loadTorch(
+            weightPath("vae/diffusion_pytorch_model.safetensors",
+                       "hunyuan3d-paint-v2-0/vae/diffusion_pytorch_model.safetensors"),
+            renames: [(".to_out.0.", ".to_out.")])))
+    }
+
+    private func loadSR() -> RealESRGAN? {
+        guard superRes,
+              let arrs = try? loadArrays(url: URL(fileURLWithPath: weightPath(
+                "realesrgan/rrdbnet_mlx.safetensors"))) else { return nil }
+        return RealESRGAN(W(arrs.mapValues {
+            $0.dtype.isFloatingPoint && $0.dtype != .float16 ? $0.asType(.float16) : $0
+        }))
+    }
+
+    private func releaseStage() {
+        MLX.Memory.clearCache()
+    }
+
+    private func memoryLine(_ stage: String) {
+        func gib(_ n: Int) -> String { String(format: "%.2f", Double(n) / 1_073_741_824) }
+        print("[memory] \(stage): active=\(gib(MLX.Memory.activeMemory)) GiB " +
+              "cache=\(gib(MLX.Memory.cacheMemory)) GiB peak=\(gib(MLX.Memory.peakMemory)) GiB")
+    }
+
+    private func encodeControls(normals: [MLXArray], positions: [MLXArray], imagePath: String)
+        throws -> (normal: MLXArray, position: MLXArray, reference: MLXArray) {
+        let vae = try loadVAE()
+        func enc(_ imgs: [MLXArray]) -> MLXArray {
+            vae.encodeMean(stacked(imgs) * 2 - 1) * sf
         }
-        let r = (vae, wrap, dino, sr)
-        pbr = r
-        return r
+        let normal = enc(normals).expandedDimensions(axis: 0)
+        eval(normal)
+        let position = enc(positions).expandedDimensions(axis: 0)
+        eval(position)
+        let reference = enc([prepRGB(imagePath, res)]).expandedDimensions(axis: 0)
+        eval(reference)
+        return (normal, position, reference)
+    }
+
+    private func dinoHidden(_ imagePath: String) throws -> MLXArray {
+        let dino = Dinov2(W(try Weights.loadTorch(weightPath(
+            "dinov2/model.safetensors", "dinov2-giant/model.safetensors"))))
+        let pixels = imagenetNorm(prepRGB(imagePath, 518)).expandedDimensions(axis: 0)
+        let hidden = dino(pixels)
+        eval(hidden)
+        return hidden
+    }
+
+    private func preparedRGB(_ refLat: MLXArray)
+        throws -> (main: W, ced: [String: MLXArray], gen: MLXArray) {
+        let (main, dual) = Weights.splitPBR(try Weights.loadTorch(
+            weightPath("hunyuan3d-paint-v2-0/unet/diffusion_pytorch_model.safetensors",
+                       "unet/diffusion_pytorch_model.safetensors"),
+            renames: [("transformer_blocks.0.transformer.", "transformer_blocks.0.")]))
+        let ced = Paint20Wrapper(main: main, dual: dual).prepare(refLat: refLat)
+        eval(Array(ced.values))
+        let gen = main.a("learned_text_clip_gen")
+        eval(gen)
+        return (main, ced, gen)
+    }
+
+    private func preparedPBR(refLat: MLXArray, dinoHidden: MLXArray, posmap: MLXArray,
+                             h: Int, n: Int)
+        throws -> (main: W, ced: [String: MLXArray], dino: MLXArray,
+                   rope: [Int: (MLXArray, MLXArray)]) {
+        let (main, dual) = Weights.splitPBR(try Weights.loadTorch(
+            weightPath("unet/diffusion_pytorch_model.safetensors",
+                       "hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.safetensors")))
+        let prepared = PBRWrapper(main: main, dual: dual, nPbr: 2)
+            .prepare(refLat: refLat, dinoHidden: dinoHidden, posmap: posmap, H: h, nGen: n)
+        eval(Array(prepared.ced.values))
+        eval(prepared.dino)
+        let ropeArrays = prepared.rope.values.flatMap { [$0.0, $0.1] }
+        if !ropeArrays.isEmpty { eval(ropeArrays) }
+        return (main, prepared.ced, prepared.dino, prepared.rope)
+    }
+
+    private func denoiseRGB(normalLat: MLXArray, positionLat: MLXArray, refLat: MLXArray,
+                            guidance: Float, seed: UInt64,
+                            onProgress: ((String, Float) -> Void)?, isCancelled: () -> Bool,
+                            onViews: ((Data) -> Void)?)
+        throws -> MLXArray? {
+        let prepared = try preparedRGB(refLat)
+        releaseStage()                         // dual UNet is no longer referenced after prepare
+        memoryLine("RGB conditioner released")
+        let wrap = Paint20Wrapper(main: prepared.main, dual: W([:]))
+        let (sig, ts) = uniPCSchedule(steps)
+        let sched = UniPCScheduler(sigmas: sig, timesteps: ts)
+        MLXRandom.seed(seed)
+        let n = elevs.count, h = res / 8
+        var latents = MLXRandom.normal([1, n, h, h, 4])
+        let neg = zeros(prepared.gen.shape)
+        let camGen = (0..<n).map { Int32($0) }
+        for (i, t) in ts.enumerated() {
+            if isCancelled() { return nil }
+            let tArr = MLXArray(Array(repeating: Float(t), count: n))
+            let vc = wrap.predict(latents, tArr, text: prepared.gen, normalLat: normalLat,
+                                  positionLat: positionLat, camGen: camGen, ced: prepared.ced,
+                                  mvaScale: 1, refScale: 1)
+            eval(vc)                            // do not retain two complete lazy UNet graphs
+            let vu = wrap.predict(latents, tArr, text: neg, normalLat: normalLat,
+                                  positionLat: positionLat, camGen: camGen, ced: nil,
+                                  mvaScale: 1, refScale: 0)
+            eval(vu)
+            latents = sched.step(vu + guidance * (vc - vu), t, latents)
+            eval(latents)
+            onProgress?("Painting (\(i+1)/\(steps))", 0.15 + 0.6 * Float(i + 1) / Float(steps))
+            releaseStage()
+            if let onViews, i % 3 == 2 || i == steps - 1,
+               let data = try previewPNG(latents[0]) {
+                onViews(data)
+                releaseStage()
+            }
+        }
+        return latents
+    }
+
+    private func denoisePBR(normalLat: MLXArray, positionLat: MLXArray, refLat: MLXArray,
+                            dinoHidden: MLXArray, posmap: MLXArray, guidance: Float, seed: UInt64,
+                            onProgress: ((String, Float) -> Void)?, isCancelled: () -> Bool,
+                            onViews: ((Data) -> Void)?)
+        throws -> MLXArray? {
+        let n = elevs.count, h = res / 8
+        let prepared = try preparedPBR(refLat: refLat, dinoHidden: dinoHidden, posmap: posmap,
+                                       h: h, n: n)
+        releaseStage()                         // dual UNet graph + weights are now reclaimable
+        memoryLine("PBR conditioner released")
+        let wrap = PBRWrapper(main: prepared.main, dual: W([:]), nPbr: 2)
+        let (sig, ts) = uniPCSchedule(steps)
+        let sched = UniPCScheduler(sigmas: sig, timesteps: ts)
+        MLXRandom.seed(seed)
+        var latents = MLXRandom.normal([1, 2, n, h, h, 4])
+        let dinoZero = zeros(prepared.dino.shape)
+        let nb = 2 * n
+        for (i, t) in ts.enumerated() {
+            if isCancelled() { return nil }
+            let tArr = MLXArray(Array(repeating: Float(t), count: nb))
+            let vc = wrap.predict(latents, tArr, normalLat: normalLat, positionLat: positionLat,
+                                  ced: prepared.ced, dino: prepared.dino, rope: prepared.rope,
+                                  mvaScale: 1, refScale: 1)
+            eval(vc)                            // serialize CFG to halve peak activation graphs
+            let vu = wrap.predict(latents, tArr, normalLat: normalLat, positionLat: positionLat,
+                                  ced: nil, dino: dinoZero, rope: prepared.rope,
+                                  mvaScale: 1, refScale: 0)
+            eval(vu)
+            latents = sched.step(vu + guidance * (vc - vu), t, latents)
+            eval(latents)
+            onProgress?("Painting (\(i+1)/\(steps))", 0.15 + 0.6 * Float(i + 1) / Float(steps))
+            releaseStage()
+            if let onViews, i % 3 == 2 || i == steps - 1,
+               let data = try previewPNG(latents[0, 0]) {
+                onViews(data)
+                releaseStage()
+            }
+        }
+        return latents
+    }
+
+    private func decodeViews(_ latents: [MLXArray]) throws -> [[MLXArray]] {
+        let vae = try loadVAE()
+        var result = [[MLXArray]]()
+        for latent in latents {
+            let decoded = clip((vae.decode(latent / sf) + 1) / 2, min: 0, max: 1)
+            eval(decoded)
+            result.append((0..<elevs.count).map { decoded[$0] })
+        }
+        eval(result.flatMap { $0 })
+        return result
+    }
+
+    private func previewPNG(_ latent: MLXArray) throws -> Data? {
+        let views = try decodeViews([latent])[0]
+        return pngData(concatenated(views, axis: 1))
+    }
+
+    private func superResolve(_ groups: [[MLXArray]]) -> [[MLXArray]] {
+        guard let sr = loadSR() else { return groups }
+        var result = [[MLXArray]]()
+        for group in groups {
+            var upscaled = [MLXArray]()
+            for view in group {
+                let up = clip(sr(view.expandedDimensions(axis: 0))[0], min: 0, max: 1)
+                eval(up)                        // one view at a time; never retain 12 SR graphs
+                upscaled.append(up)
+                releaseStage()
+            }
+            result.append(upscaled)
+        }
+        return result
     }
 
     /// CLI-shaped PBR paint: file paths in, GLB out. Thin shell over `paintPBR` — the pipeline
     /// core is shared with the app entry point; this only loads the mesh, writes the debug
     /// texture PNGs next to the output, and serializes the GLB.
     public func run(meshPath: String, imagePath: String, outGLB: String,
-                    guidance: Float = 3.0) throws {
+                    guidance: Float = 3.0, seed: UInt64 = 0) throws {
         let t0 = Date()
         func log(_ s: String) { print("[pipeline] \(s)  (\(Int(-t0.timeIntervalSinceNow))s)") }
         let mesh = loadMesh(meshPath)
-        guard let r = try paintPBR(mesh: mesh, imagePath: imagePath, guidance: guidance,
+        guard let r = try paintPBR(mesh: mesh, imagePath: imagePath, guidance: guidance, seed: seed,
                                    debugPathPrefix: outGLB,
                                    onProgress: { s, _ in log(s) }) else { return }
         // debug: the baked textures next to the GLB (same bytes that get embedded)
@@ -130,10 +298,6 @@ public final class PaintPipeline {
                          onProgress: ((String, Float) -> Void)? = nil,
                          isCancelled: () -> Bool = { false },
                          onViews: ((Data) -> Void)? = nil) throws -> PaintResult? {
-        onProgress?("Loading paint model", 0.02)
-        let (vae, wrap, srModel, gen) = try loadRGB()
-        if isCancelled() { return nil }
-
         onProgress?("Unwrapping UVs", 0.05)
         guard let uw = xatlasUnwrap(vertices: mesh.vertices, vertexCount: mesh.vertexCount,
                                     faces: mesh.faces, faceCount: mesh.faceCount) else { return nil }
@@ -145,42 +309,29 @@ public final class PaintPipeline {
         onProgress?("Rendering control maps", 0.1)
         let ctrl = zip(elevs, azims).map { R.renderControl($0.0, $0.1, res) }
         let normals = ctrl.map { $0.0 }, positions = ctrl.map { $0.1 }
-        func enc(_ imgs: [MLXArray]) -> MLXArray { vae.encodeMean(stacked(imgs) * 2 - 1) * sf }
-        let normalLat = enc(normals).expandedDimensions(axis: 0)
-        let positionLat = enc(positions).expandedDimensions(axis: 0)
-        let refLat = enc([prepRGB(imagePath, res)]).expandedDimensions(axis: 0)   // [1,1,h,w,4]
-        let N = elevs.count, h = res / 8
+        onProgress?("Encoding controls", 0.12)
+        let encoded = try encodeControls(normals: normals, positions: positions, imagePath: imagePath)
+        releaseStage()
+        memoryLine("VAE encoder released")
         if isCancelled() { return nil }
 
-        let (sig, ts) = uniPCSchedule(steps)
-        let sched = UniPCScheduler(sigmas: sig, timesteps: ts)
-        MLXRandom.seed(seed)
-        var latents = MLXRandom.normal([1, N, h, h, 4])
-        let ced = wrap.prepare(refLat: refLat)
-        let neg = zeros(gen.shape)
-        let camGen = (0..<N).map { Int32($0) }
-        for (i, t) in ts.enumerated() {
-            if isCancelled() { return nil }
-            let tArr = MLXArray(Array(repeating: Float(t), count: N))
-            let vc = wrap.predict(latents, tArr, text: gen, normalLat: normalLat, positionLat: positionLat, camGen: camGen, ced: ced, mvaScale: 1, refScale: 1)
-            let vu = wrap.predict(latents, tArr, text: neg, normalLat: normalLat, positionLat: positionLat, camGen: camGen, ced: nil, mvaScale: 1, refScale: 0)
-            latents = sched.step(vu + guidance * (vc - vu), t, latents); eval(latents)
-            onProgress?("Painting (\(i+1)/\(steps))", 0.15 + 0.6 * Float(i + 1) / Float(steps))
-            if let onViews, i % 3 == 2 || i == steps - 1 {
-                let prev = clip((vae.decode(latents[0] / sf) + 1) / 2, min: 0, max: 1)   // [N,H,W,3]
-                let grid = concatenated((0..<N).map { prev[$0] }, axis: 1)
-                if let d = pngData(grid) { onViews(d) }
-            }
-            MLX.Memory.clearCache()                    // release per-step UNet/decode buffers
-        }
+        guard let latents = try denoiseRGB(normalLat: encoded.normal, positionLat: encoded.position,
+                                           refLat: encoded.reference, guidance: guidance, seed: seed,
+                                           onProgress: onProgress, isCancelled: isCancelled,
+                                           onViews: onViews) else { return nil }
+        releaseStage()
+        memoryLine("RGB denoiser released")
         if isCancelled() { return nil }
 
         onProgress?("Decoding views", 0.8)
-        let dd = clip((vae.decode(latents[0] / sf) + 1) / 2, min: 0, max: 1)       // [N,H,W,3]
-        var views = (0..<N).map { dd[$0] }
-        if let sr = srModel {
+        var views = try decodeViews([latents[0]])[0]
+        releaseStage()
+        memoryLine("VAE decoder released")
+        if superRes {
             onProgress?("Super-resolving", 0.88)
-            views = views.map { clip(sr($0.expandedDimensions(axis: 0))[0], min: 0, max: 1) }; eval(views[0])
+            views = superResolve([views])[0]
+            releaseStage()
+            memoryLine("super-resolution released")
         }
         if isCancelled() { return nil }
 
@@ -205,10 +356,6 @@ public final class PaintPipeline {
                          onProgress: ((String, Float) -> Void)? = nil,
                          isCancelled: () -> Bool = { false },
                          onViews: ((Data) -> Void)? = nil) throws -> PBRPaintResult? {
-        onProgress?("Loading paint model", 0.02)
-        let (vae, wrap, dino, srModel) = try loadPBR()
-        if isCancelled() { return nil }
-
         onProgress?("Unwrapping UVs", 0.05)
         guard let uw = xatlasUnwrap(vertices: mesh.vertices, vertexCount: mesh.vertexCount,
                                     faces: mesh.faces, faceCount: mesh.faceCount) else { return nil }
@@ -220,52 +367,40 @@ public final class PaintPipeline {
         onProgress?("Rendering control maps", 0.1)
         let ctrl = zip(elevs, azims).map { R.renderControl($0.0, $0.1, res) }
         let normals = ctrl.map { $0.0 }, positions = ctrl.map { $0.1 }
-        func enc(_ imgs: [MLXArray]) -> MLXArray { vae.encodeMean(stacked(imgs) * 2 - 1) * sf }
-        let normalLat = enc(normals).expandedDimensions(axis: 0)               // [1,N,h,w,4]
-        let positionLat = enc(positions).expandedDimensions(axis: 0)
-        let refLat = enc([prepRGB(imagePath, res)]).expandedDimensions(axis: 0) // [1,1,h,w,4]
-        let di = imagenetNorm(prepRGB(imagePath, 518)).expandedDimensions(axis: 0)
-        let dinoHS = dino(di)                                                   // [1,1370,1536]
+        onProgress?("Encoding controls", 0.12)
+        let encoded = try encodeControls(normals: normals, positions: positions, imagePath: imagePath)
+        releaseStage()
+        memoryLine("VAE encoder released")
+        onProgress?("Encoding reference", 0.14)
+        let dinoHS = try dinoHidden(imagePath)
+        releaseStage()
+        memoryLine("DINO released")
         let posmap = stacked(positions).expandedDimensions(axis: 0)            // [1,N,res,res,3]
-        let N = elevs.count, h = res / 8
-        eval(normalLat, positionLat, refLat, dinoHS)
+        eval(posmap)
         if isCancelled() { return nil }
 
-        let (sig, ts) = uniPCSchedule(steps)
-        let sched = UniPCScheduler(sigmas: sig, timesteps: ts)
-        MLXRandom.seed(seed)
-        var latents = MLXRandom.normal([1, 2, N, h, h, 4])                     // dim 1: [albedo, mr]
-        let (ced, dinoTok, rope) = wrap.prepare(refLat: refLat, dinoHidden: dinoHS, posmap: posmap, H: h, nGen: N)
-        let dinoZero = zeros(dinoTok.shape)
-        let nb = 1 * 2 * N
-        for (i, t) in ts.enumerated() {
-            if isCancelled() { return nil }
-            let tArr = MLXArray(Array(repeating: Float(t), count: nb))
-            let vc = wrap.predict(latents, tArr, normalLat: normalLat, positionLat: positionLat, ced: ced, dino: dinoTok, rope: rope, mvaScale: 1, refScale: 1)
-            let vu = wrap.predict(latents, tArr, normalLat: normalLat, positionLat: positionLat, ced: nil, dino: dinoZero, rope: rope, mvaScale: 1, refScale: 0)
-            latents = sched.step(vu + guidance * (vc - vu), t, latents); eval(latents)
-            onProgress?("Painting (\(i+1)/\(steps))", 0.15 + 0.6 * Float(i + 1) / Float(steps))
-            if let onViews, i % 3 == 2 || i == steps - 1 {
-                let prev = clip((vae.decode(latents[0, 0] / sf) + 1) / 2, min: 0, max: 1)   // albedo [N,H,W,3]
-                let grid = concatenated((0..<N).map { prev[$0] }, axis: 1)
-                if let d = pngData(grid) { onViews(d) }
-            }
-            MLX.Memory.clearCache()                    // release per-step UNet/decode buffers
-        }
+        guard let latents = try denoisePBR(normalLat: encoded.normal, positionLat: encoded.position,
+                                           refLat: encoded.reference, dinoHidden: dinoHS,
+                                           posmap: posmap, guidance: guidance, seed: seed,
+                                           onProgress: onProgress, isCancelled: isCancelled,
+                                           onViews: onViews) else { return nil }
+        releaseStage()
+        memoryLine("PBR denoiser released")
         if isCancelled() { return nil }
 
         onProgress?("Decoding views", 0.8)
-        func decode(_ lat: MLXArray) -> [MLXArray] {
-            let d = clip((vae.decode(lat / sf) + 1) / 2, min: 0, max: 1)        // [N,H,W,3]
-            return (0..<N).map { d[$0] }
-        }
-        var alb = decode(latents[0, 0]), mr = decode(latents[0, 1])
+        var decoded = try decodeViews([latents[0, 0], latents[0, 1]])
+        var alb = decoded[0], mr = decoded[1]
+        decoded.removeAll(keepingCapacity: false)
+        releaseStage()
+        memoryLine("VAE decoder released")
         if let p = debugPathPrefix { saveRGB(concatenated(alb, axis: 1), "\(p).views.png") }  // debug: albedo views grid
-        if let sr = srModel {
+        if superRes {
             onProgress?("Super-resolving", 0.88)
-            func up(_ v: MLXArray) -> MLXArray { clip(sr(v.expandedDimensions(axis: 0))[0], min: 0, max: 1) }
-            alb = alb.map(up); mr = mr.map(up)
-            eval(alb[0])
+            let upscaled = superResolve([alb, mr])
+            alb = upscaled[0]; mr = upscaled[1]
+            releaseStage()
+            memoryLine("super-resolution released")
         }
         if isCancelled() { return nil }
 

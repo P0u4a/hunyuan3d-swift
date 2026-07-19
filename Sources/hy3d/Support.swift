@@ -129,11 +129,13 @@ func printUsage() {
                     [--steps N] [--guidance F] [--octree N] [--quantize 4|8] [--seed N]
 
       hy3d paint    <mesh.glb|obj> <image.png> -o <out.glb> --weights <dir>
-                    [--model rgb|pbr] [--res N] [--steps N] [--tex N] [--no-superres] [--seed N]
+                    [--model rgb|pbr] [--res N] [--steps N] [--tex N] [--no-superres]
+                    [--cache-mb N] [--seed N]
 
       hy3d generate <image.png> -o <out.glb> --shape-weights <dir> --paint-weights <dir>
                     [--paint-model rgb|pbr] [--steps N] [--guidance F] [--octree N]
-                    [--quantize 4|8] [--paint-steps N] [--res N] [--tex N] [--no-superres] [--seed N]
+                    [--quantize 4|8] [--paint-steps N] [--res N] [--tex N] [--no-superres]
+                    [--cache-mb N] [--seed N]
 
       hy3d parity-shape [--fixtures <dir>] [--weights <dir>] [--weights-turbo <dir>]
       hy3d parity-paint [--fixtures <dir>]
@@ -143,10 +145,10 @@ func printUsage() {
 
     Notes:
       • shape --weights points at a checkpoint directory (model.fp16.safetensors + config.yaml).
-      • paint --weights points at a weights root containing hunyuan3d-paint-v2-0/,
-        hunyuan3d-paintpbr-v2-1/, dinov2-giant/, realesrgan/.
+      • paint --weights accepts the downloaded paint bundle (vae/, unet/, dinov2/,
+        realesrgan/) and the older nested checkpoint layout.
       • --octree N is the SDF grid resolution (octree decode). Default 256.
-      • paint --seed is accepted for interface parity; the paint pipeline currently re-seeds its
-        RNG to 0 internally, so it has no effect there yet. shape/generate honor --seed.
+      • paint models are loaded one stage at a time; --cache-mb defaults to 128 for 24 GB Macs.
+      • --seed is honored by shape, paint and the chained generate command.
     """)
 }

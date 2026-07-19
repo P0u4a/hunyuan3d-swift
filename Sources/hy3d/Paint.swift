@@ -17,18 +17,21 @@ func cmdPaint(_ args: Args) throws {
     let steps = args.int("steps") ?? 15
     let tex = args.int("tex") ?? (model == "pbr" ? 4096 : 2048)
     let superRes = !args.flag("no-superres")
-    if let seed = args.int("seed") { MLXRandom.seed(UInt64(seed)) }   // see note in `hy3d help`
+    let seed = UInt64(args.int("seed") ?? 0)
+    let cacheMB = args.int("cache-mb") ?? 128
+    MLX.Memory.peakMemory = 0
 
-    let pipe = PaintPipeline(weightsRoot: weights, res: res, steps: steps, tex: tex, superRes: superRes)
+    let pipe = PaintPipeline(weightsRoot: weights, res: res, steps: steps, tex: tex,
+                             superRes: superRes, cacheLimitMB: cacheMB)
     print("paint (\(model)): mesh=\(meshPath) image=\(imagePath) res=\(res) steps=\(steps) tex=\(tex) super-res=\(superRes)")
     switch model {
     case "pbr":
-        try pipe.run(meshPath: meshPath, imagePath: imagePath, outGLB: out)
+        try pipe.run(meshPath: meshPath, imagePath: imagePath, outGLB: out, seed: seed)
         print("paint: wrote \(out)")
     case "rgb":
         let lm = loadMesh(meshPath)
         guard lm.vertexCount > 0 else { throw CLIError("paint: failed to load mesh \(meshPath)") }
-        guard let r = try pipe.paintRGB(mesh: lm, imagePath: imagePath, onProgress: { s, f in
+        guard let r = try pipe.paintRGB(mesh: lm, imagePath: imagePath, seed: seed, onProgress: { s, f in
             print(String(format: "  [%3.0f%%] %@", f * 100, s))
         }) else { throw CLIError("paint: RGB pipeline returned no result (UV unwrap failed?)") }
         try writeGLB(path: out, vertices: r.vertices, faces: r.faces, uvs: r.uvs,
@@ -37,6 +40,7 @@ func cmdPaint(_ args: Args) throws {
     default:
         throw CLIError("paint: --model must be rgb or pbr")
     }
+    print(String(format: "paint: MLX peak %.2f GiB", Double(MLX.Memory.peakMemory) / 1_073_741_824))
 }
 
 // MARK: - hy3d parity-paint (print-panel; ported from the v1 paint-cli parity harness)

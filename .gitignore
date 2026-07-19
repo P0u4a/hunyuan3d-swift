@@ -3,8 +3,10 @@
 fixtures/
 weights/
 *.log
+*.profraw
 .DS_Store
 __pycache__/
+outputs/
 
 # Heavy E2E artifacts (GLBs, full-res renders, logs). Curated README images live
 # in docs/images/ and are committed explicitly.

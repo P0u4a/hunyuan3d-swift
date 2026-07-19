@@ -20,6 +20,12 @@ the swift code is checked against python fixtures. the python ports are checked 
 | `hy3d generate` (small / rgb) | chained | 240 s | ~25 gb |
 | `hy3d generate` (large / pbr) | chained | 360 s | ~33 gb |
 
+the low-memory pipeline on `codex/21gb-low-memory` has also been measured end-to-end on an
+m4 pro with 24 gb unified memory. small shape + 2.1 pbr paint at 512, 15 steps, a 4096 atlas,
+and x4 super-resolution completed in 420 s with a 17.50 gib mlx peak and zero swaps. models are
+loaded by stage, both cfg passes are evaluated sequentially, dino is evaluated one block at a
+time, and the mlx cache defaults to 128 mb.
+
 that's hunyuan3D-shape running in FIVE POINT SIX gigabytes of RAM (thanks to MLX). with a Q8 or Q4, we are easily in mobile territory. now, what would you do with a image to 3d model running on your phone (iPhone 15 onwards)? not sure, but that's really really cool, the first time it has been possible (AFAIK). here's some demos (checkout [Modelr](https://github.com/ZimengXiong/Modelr):
 
 https://github.com/user-attachments/assets/495de7e8-6c76-4b3f-af37-ffa23e0b0a64
@@ -40,6 +46,15 @@ main commands:
 ```bash
 swift build -c release
 swift run -c release hy3d --help
+```
+
+`swift build` is useful as a compile check, but swiftpm cannot build mlx's metal shader library.
+for a runnable command-line binary, use xcode's package builder:
+
+```bash
+xcodebuild -scheme hy3d -destination 'platform=macOS' -configuration Release \
+  -derivedDataPath .build/xcode CODE_SIGNING_ALLOWED=NO build
+.build/xcode/Build/Products/Release/hy3d --help
 ```
 
 ## weights
@@ -65,7 +80,8 @@ shape plus paint:
 ```bash
 swift run -c release hy3d generate photo.png -o out.glb \
   --shape-weights weights/shape-small \
-  --paint-weights weights/paint-large
+  --paint-weights weights/paint-large \
+  --paint-model pbr --cache-mb 128
 ```
 
 shape only:
@@ -81,6 +97,9 @@ paint an existing mesh:
 swift run -c release hy3d paint mesh.glb photo.png -o textured.glb \
   --weights weights/paint-large --model pbr
 ```
+
+replace `swift run -c release hy3d` in the examples above with
+`.build/xcode/Build/Products/Release/hy3d` for the metal-enabled command-line build.
 
 ## license
 

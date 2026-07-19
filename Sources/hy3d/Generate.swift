@@ -27,19 +27,26 @@ func cmdGenerate(_ args: Args) throws {
     let res = args.int("res") ?? 512
     let tex = args.int("tex") ?? (paintModel == "pbr" ? 4096 : 2048)
     let superRes = !args.flag("no-superres")
+    let cacheMB = args.int("cache-mb") ?? 128
+    MLX.Memory.peakMemory = 0
 
     // ---- 1. shape ----
     print("generate[1/2] shape: \(shapeURL.lastPathComponent)  steps=\(steps) octree=\(resolution)")
-    let gen = try ShapeGenerator(weightsURL: shapeURL, quantize: quantize)
-    guard let mesh = gen.generate(image: cg, steps: steps, guidance: guidance, seed: seed,
-                                  resolution: resolution, octree: true, onProgress: { p in
-        print(String(format: "  [%3.0f%%] %@", p.fraction * 100, p.stage))
-    }) else { throw CLIError("generate: shape stage failed (image preprocessing?)") }
+    let mesh: Mesh = try { () throws -> Mesh in
+        let gen = try ShapeGenerator(weightsURL: shapeURL, quantize: quantize, cacheLimitMB: cacheMB)
+        guard let result = gen.generate(image: cg, steps: steps, guidance: guidance, seed: seed,
+                                        resolution: resolution, octree: true, onProgress: { p in
+            print(String(format: "  [%3.0f%%] %@", p.fraction * 100, p.stage))
+        }) else { throw CLIError("generate: shape stage failed (image preprocessing?)") }
+        return result
+    }()
+    MLX.Memory.clearCache()                    // release all shape weights before paint loads
     print("generate[1/2] shape mesh: \(mesh.vertices.count) verts, \(mesh.faces.count) faces")
 
     // ---- 2. paint ----
     print("generate[2/2] paint (\(paintModel)): res=\(res) steps=\(paintSteps) tex=\(tex) super-res=\(superRes)")
-    let pipe = PaintPipeline(weightsRoot: paintW, res: res, steps: paintSteps, tex: tex, superRes: superRes)
+    let pipe = PaintPipeline(weightsRoot: paintW, res: res, steps: paintSteps, tex: tex,
+                             superRes: superRes, cacheLimitMB: cacheMB)
     switch paintModel {
     case "pbr":
         // The PBR path writes the GLB itself; hand it the shape mesh via a temp .glb.
@@ -47,9 +54,9 @@ func cmdGenerate(_ args: Args) throws {
             .appendingPathComponent("hy3d_shape_\(UUID().uuidString).glb")
         try GLB.write(mesh, to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try pipe.run(meshPath: tmp.path, imagePath: imagePath, outGLB: out)
+        try pipe.run(meshPath: tmp.path, imagePath: imagePath, outGLB: out, seed: seed)
     case "rgb":
-        guard let r = try pipe.paintRGB(mesh: flatten(mesh), imagePath: imagePath, onProgress: { s, f in
+        guard let r = try pipe.paintRGB(mesh: flatten(mesh), imagePath: imagePath, seed: seed, onProgress: { s, f in
             print(String(format: "  [%3.0f%%] %@", f * 100, s))
         }) else { throw CLIError("generate: paint stage returned no result (UV unwrap failed?)") }
         try writeGLB(path: out, vertices: r.vertices, faces: r.faces, uvs: r.uvs,
@@ -58,4 +65,5 @@ func cmdGenerate(_ args: Args) throws {
         throw CLIError("generate: --paint-model must be rgb or pbr")
     }
     print("generate: wrote \(out)")
+    print(String(format: "generate: MLX peak %.2f GiB", Double(MLX.Memory.peakMemory) / 1_073_741_824))
 }
